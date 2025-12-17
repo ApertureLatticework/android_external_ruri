@@ -1298,7 +1298,7 @@ static void detect_suid_or_capability(void)
 #endif
 }
 // The real main() function.
-int ruri(int argc, char **argv)
+int main(int argc, char **argv)
 {
 	// Detect SUID or capability.
 	detect_suid_or_capability();

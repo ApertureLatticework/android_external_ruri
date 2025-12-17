@@ -1,0 +1,78 @@
+// Android.bp for ruri_core
+// Build a hardened, minimal ruri binary for Android
+
+cc_binary {
+    name: "ruri",
+
+    // Source files
+    srcs: [
+        "src/*.c",
+        "src/easteregg/*.c",
+    ],
+
+    // C-only
+    compile_multilib: "first", // or "both" if needed for 32/64
+    vendor_available: true,    // or remove if not for vendor partition
+    product_specific: true,    // optional
+
+    // Disable optional features → core-only
+    cflags: [
+        "-DDISABLE_LIBCAP",
+        "-DDISABLE_LIBSECCOMP",
+        "-DDISABLE_RURIENV",
+        "-DRURI_CORE_ONLY",
+        "-DNDEBUG",
+        "-D_FILE_OFFSET_BITS=64",
+        "-DRURI_COMMIT_ID=\"android\"", // or use git if in build env
+        // Android NDK supports most of these
+        "-fPIE",
+        "-fstack-protector-strong",
+        "-fno-omit-frame-pointer",
+        "-fdata-sections",
+        "-ffunction-sections",
+        "-pipe",
+        "-O2",
+	"-Wno-date-time",
+        // Note: -flto, -mshstk, -ftrivial-auto-var-init may NOT be supported
+        // on all NDK versions → omit for compatibility
+    ],
+
+    // Security hardening flags (Android default + extras)
+    sanitize: {
+        cfi: false, // enable if needed
+    },
+    cppflags: [], // none for C project
+
+    // Linker flags
+    ldflags: [
+        "-Wl,-z,relro",
+        "-Wl,-z,now",
+        "-Wl,-z,noexecstack",
+        "-Wl,--gc-sections",
+        "-pie", // mandatory for Android executables
+        "-Wl,--build-id=sha1",
+    ],
+
+    // No extra libraries (core-only)
+    // Android bionic provides: pthread, basic syscalls
+    shared_libs: [
+        "libdl",      // often needed for dlopen (even if not used)
+        "libc",       // implicit, but explicit for clarity
+        "libm",       // math
+    ],
+
+    // Static not recommended on Android (use shared)
+    // static_executable: true, // avoid unless necessary
+
+    // Strip debug symbols (default in user/userdebug builds)
+    strip: {
+        all: true,
+    },
+
+    // Only build on Linux-based targets (Android is Linux)
+    target: {
+        android: {
+            enabled: true,
+        },
+    },
+}
