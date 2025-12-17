@@ -69,7 +69,6 @@ void ruri_show_version_info(void)
 	cprintf("{base}%s%d%s%d%s", "libk2v ...........:  ", LIBK2V_MAJOR, ".", LIBK2V_MINOR, "\n");
 	cprintf("{base}%s%d%s%d%s", "cprintf ..........:  ", CPRINTF_MAJOR, ".", CPRINTF_MINOR, "\n");
 	cprintf("{base}%s%s\n", "Compiler version .:  ", __VERSION__);
-	cprintf("{base}%s%s\n", "Build date .......:  ", __TIMESTAMP__);
 	cprintf("{base}\nThere is NO WARRANTY, to the extent permitted by law\n");
 	cprintf("{base}This program has Super Neko Powers!!!\n");
 	cprintf("{clear}\n");

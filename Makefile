@@ -1,8 +1,8 @@
 CC=gcc
-CFLAGS=-g -O0 -Wall
-OS_TARGET=scetool
+CFLAGS= -O2 -pipe -fPIE -DDISABLE_LIBCAP -DDISABLE_LIBSECCOMP -DDISABLE_RURIENV -DRURI_CORE_ONLY -DNDEBUG -D_FILE_OFFSET_BITS=64
+OS_TARGET=ruri
 LDFLAGS=-lz
-OBJS=src/easteregg/action.o src/easteregg/nekofeng.o src/easteregg/layer.o src/easteregg/typewriter.o src/caplist.o src/chroot.o src/cprintf.o src/info.o src/rurienv.o src/rurifetch.o src/seccomp.o src/signal.o src/umount.o src/unshare.o src/rootless.o src/mount.o src/k2v.o src/elf-magic.o src/config.o src/cgroup.o src/passwd.o src/ps.o src/ruri.o
+OBJS=src/easteregg/action.o src/easteregg/nekofeng.o src/easteregg/layer.o src/easteregg/typewriter.o src/caplist.o src/chroot.o src/cprintf.o src/info.o src/rurienv.o src/seccomp.o src/signal.o src/umount.o src/unshare.o src/rootless.o src/mount.o src/k2v.o src/elf-magic.o src/config.o src/cgroup.o src/passwd.o src/ps.o src/ruri.o
 .SILENT:
 .SUFFIXES: .c .cpp .o
 

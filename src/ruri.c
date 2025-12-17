@@ -225,11 +225,6 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
 			ruri_show_examples();
 			exit(EXIT_SUCCESS);
 		}
-		// Show neofeth-like ruri version info.
-		if (strcmp(argv[index], "-F") == 0 || strcmp(argv[index], "--ruri-fetch") == 0) {
-			ruri_fetch();
-			exit(EXIT_SUCCESS);
-		}
 		// Umount a container.
 		if (strcmp(argv[index], "-U") == 0 || strcmp(argv[index], "--umount") == 0) {
 			// Clear envs.

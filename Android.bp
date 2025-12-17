@@ -32,7 +32,6 @@ cc_binary {
         "-ffunction-sections",
         "-pipe",
         "-O2",
-	"-Wno-date-time",
         // Note: -flto, -mshstk, -ftrivial-auto-var-init may NOT be supported
         // on all NDK versions → omit for compatibility
     ],
