@@ -15,10 +15,7 @@ cc_binary {
 
     // Disable optional features → core-only
     cflags: [
-        "-DDISABLE_LIBCAP",
         "-DDISABLE_LIBSECCOMP",
-        "-DDISABLE_RURIENV",
-        "-DRURI_CORE_ONLY",
         "-DNDEBUG",
         "-D_FILE_OFFSET_BITS=64",
         "-DRURI_COMMIT_ID=\"android\"", // or use git if in build env
@@ -55,7 +52,7 @@ cc_binary {
     shared_libs: [
         "libdl",      // often needed for dlopen (even if not used)
         "libc",       // implicit, but explicit for clarity
-        "libm",       // math
+        "libcap",
     ],
 
     // Static not recommended on Android (use shared)
