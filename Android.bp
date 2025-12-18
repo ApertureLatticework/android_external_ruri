@@ -15,7 +15,6 @@ cc_binary {
 
     // Disable optional features → core-only
     cflags: [
-        "-DDISABLE_LIBSECCOMP",
         "-DNDEBUG",
         "-D_FILE_OFFSET_BITS=64",
         "-DRURI_COMMIT_ID=\"android\"", // or use git if in build env
@@ -50,8 +49,8 @@ cc_binary {
     // No extra libraries (core-only)
     // Android bionic provides: pthread, basic syscalls
     shared_libs: [
-        "libc",       // implicit, but explicit for clarity
         "libcap",
+        "libseccomp",
     ],
 
     // Static not recommended on Android (use shared)

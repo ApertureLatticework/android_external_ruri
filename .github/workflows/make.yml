@@ -17,7 +17,7 @@ jobs:
         run: make -n
 
       - name: Dep
-        run: sudo apt update && sudo apt install libcap-dev -y
+        run: sudo apt update && sudo apt install libcap-dev libseccomp-dev -y
 
       - name: Build
         run: make

@@ -48,6 +48,7 @@ jobs:
       run: |
         git clone https://github.com/kmiit/twrp_device_oplus_sm87xx device/oplus/sm87xx --depth=1
         git clone https://github.com/ApertureLatticework/android_external_ruri external/ruri --depth=1
+        git clone https://github.com/ApertureLatticework/android_external_libseccomp external/libseccomp --depth=1
 
     - name: Build
       run: |

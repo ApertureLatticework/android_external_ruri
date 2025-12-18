@@ -1,6 +1,6 @@
-CFLAGS= -O2 -pipe -fPIE -DDISABLE_LIBSECCOMP -DNDEBUG -D_FILE_OFFSET_BITS=64
+CFLAGS= -O2 -pipe -fPIE -DNDEBUG -D_FILE_OFFSET_BITS=64
 OS_TARGET=ruri
-LDFLAGS=-lz -lcap
+LDFLAGS=-lz -lcap -lseccomp
 OBJS=src/easteregg/action.o src/easteregg/nekofeng.o src/easteregg/layer.o src/easteregg/typewriter.o src/caplist.o src/chroot.o src/cprintf.o src/info.o src/rurienv.o src/seccomp.o src/signal.o src/umount.o src/unshare.o src/rootless.o src/mount.o src/k2v.o src/elf-magic.o src/config.o src/cgroup.o src/passwd.o src/ps.o src/ruri.o
 
 ifeq ($(origin CC), command line)
