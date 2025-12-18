@@ -30,28 +30,14 @@ jobs:
         sudo systemctl restart zramswap
         zramctl
 
-    - name: Check Out
-      uses: actions/checkout@v5
-      with:
-        fetch-depth: 0
-
     - name: Setup environment
       run: |
         export DEBIAN_FRONTEND=noninteractive
         sudo apt update && sudo apt upgrade -y
         sudo apt install repo -y
+        git init
         git config user.name ${{ github.actor }}
         git config user.email ${{ github.actor }}@users.noreply.github.com
-        echo -e "$BUILD_INFO" >> INFO.txt
-        echo "Change log:" >> INFO.txt
-        set +e
-        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
-        if [ $? -eq 0 ]; then
-          git log "$LAST_TAG"..HEAD --pretty=format:"- %h-%an: %s" >> INFO.txt
-        else
-          git log --pretty=format:"- %h-%an: %s" >> INFO.txt
-        fi
-        cat INFO.txt
 
     - name: Sync source
       run: |
@@ -61,7 +47,7 @@ jobs:
     - name: Setup device
       run: |
         git clone https://github.com/kmiit/twrp_device_oplus_sm87xx device/oplus/sm87xx --depth=1
-        git clone https://github.com/ApertureLatticework/android_external/ruri external/ruri --depth=1
+        git clone https://github.com/ApertureLatticework/android_external_ruri external/ruri --depth=1
 
     - name: Build
       run: |
