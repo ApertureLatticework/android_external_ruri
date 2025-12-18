@@ -50,7 +50,6 @@ cc_binary {
     // No extra libraries (core-only)
     // Android bionic provides: pthread, basic syscalls
     shared_libs: [
-        "libdl",      // often needed for dlopen (even if not used)
         "libc",       // implicit, but explicit for clarity
         "libcap",
     ],
