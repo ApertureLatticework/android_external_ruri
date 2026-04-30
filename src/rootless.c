@@ -210,15 +210,19 @@ static void set_id_map(uid_t uid, gid_t gid)
 	sprintf(uid_map, "0 %d 1\n", uid);
 	int uidmap_fd = open("/proc/self/uid_map", O_RDWR | O_CLOEXEC);
 	if (uidmap_fd < 0) {
-		ruri_warning("{red}Failed to open /proc/self/uid_map, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
+		ruri_warn_on_error(1, 0, true, "{red}Failed to open /proc/self/uid_map, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
 		ruri_error("{red}Failed to open /proc/self/uid_map\n");
 	}
-	write(uidmap_fd, uid_map, strlen(uid_map));
+	if (write(uidmap_fd, uid_map, strlen(uid_map)) < 0) {
+		close(uidmap_fd);
+		ruri_warn_on_error(1, 0, true, "{red}Failed to write to /proc/self/uid_map, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
+		ruri_error("{red}Failed to write to /proc/self/uid_map\n");
+	}
 	close(uidmap_fd);
 	// Set gid map.
 	int setgroups_fd = open("/proc/self/setgroups", O_RDWR | O_CLOEXEC);
 	if (setgroups_fd < 0) {
-		ruri_warning("{red}Failed to open /proc/self/setgroups, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
+		ruri_warn_on_error(1, 0, true, "{red}Failed to open /proc/self/setgroups, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
 		ruri_error("{red}Failed to open /proc/self/setgroups\n");
 	}
 	write(setgroups_fd, "deny", 5);
@@ -227,15 +231,23 @@ static void set_id_map(uid_t uid, gid_t gid)
 	sprintf(gid_map, "0 %d 1\n", gid);
 	int gidmap_fd = open("/proc/self/gid_map", O_RDWR | O_CLOEXEC);
 	if (gidmap_fd < 0) {
-		ruri_warning("{red}Failed to open /proc/self/gid_map, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
+		ruri_warn_on_error(1, 0, true, "{red}Failed to open /proc/self/gid_map, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
 		ruri_error("{red}Failed to open /proc/self/gid_map\n");
 	}
-	write(gidmap_fd, gid_map, strlen(gid_map));
+	if (write(gidmap_fd, gid_map, strlen(gid_map)) < 0) {
+		close(gidmap_fd);
+		ruri_warn_on_error(1, 0, true, "{red}Failed to write to /proc/self/gid_map, maybe you need to install uidmap package and configure /etc/subuid and /etc/subgid?\n");
+		ruri_error("{red}Failed to write to /proc/self/gid_map\n");
+	}
 	close(gidmap_fd);
 	// Maybe needless.
 	setuid(0);
 	setgid(0);
 	setgroups_fd = open("/proc/self/setgroups", O_RDWR | O_CLOEXEC);
+	if (setgroups_fd < 0) {
+		// It's fine.
+		return;
+	}
 	write(setgroups_fd, "allow", 5);
 	close(setgroups_fd);
 }
@@ -259,11 +271,26 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 	// parent process will call unshare(2) to be the owner of a new user ns,
 	// then, we can use the child process to call `newuidmap` and `newgidmap`,
 	// to change the parent process's id map.
+	int sync_pipe[2] = { -1, -1 };
+	if (container->ns_pid < 0) {
+		if (pipe2(sync_pipe, O_CLOEXEC) == -1) {
+			ruri_error("{red}Failed to create sync pipe for userns setup\n");
+		}
+	}
+
 	pid_t pid_1 = fork();
 	if (pid_1 > 0) {
 		if (container->ns_pid < 0) {
+			close(sync_pipe[0]);
 			// Enable user namespace.
 			try_unshare(CLONE_NEWUSER);
+
+			if (write(sync_pipe[1], "1", 1) != 1) {
+				close(sync_pipe[1]);
+				ruri_error("{red}Failed to signal child for idmap setup\n");
+			}
+			close(sync_pipe[1]);
+
 			int stat = 0;
 			waitpid(pid_1, &stat, 0);
 			if (WEXITSTATUS(stat) == 0) {
@@ -281,15 +308,22 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 			}
 			set_id_map_succeed = true;
 		}
-	} else {
+	} else if (pid_1 == 0) {
 		if (container->ns_pid < 0) {
-			// To ensure that unshare(2) finished in parent process.
-			usleep(1000);
+			close(sync_pipe[1]);
+			char ready = '\0';
+			ssize_t n = read(sync_pipe[0], &ready, 1);
+			close(sync_pipe[0]);
+			if (n != 1) {
+				exit(1);
+			}
 			int stat = try_setup_idmap(ppid, uid, gid);
 			exit(stat);
 		} else {
 			exit(0);
 		}
+	} else {
+		ruri_error("{red}Fork error QwQ?\n");
 	}
 	if (container->ns_pid > 0 && set_id_map_succeed) {
 		char mnt_ns[PATH_MAX] = { '\0' };
@@ -315,8 +349,8 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 		char uts_ns[PATH_MAX] = { '\0' };
 		sprintf(uts_ns, "/proc/%d/ns/uts", container->ns_pid);
 		int uts_ns_fd = open(uts_ns, O_RDONLY | O_CLOEXEC);
-		if (uts_ns_fd < 0 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that uts namespace is not supported on this device QwQ{clear}\n");
+		if (uts_ns_fd < 0) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that uts namespace is not supported on this device QwQ{clear}\n");
 		} else {
 			if (setns(uts_ns_fd, CLONE_NEWUTS) == -1) {
 				ruri_error("{red}Failed to setns(2) to %s\n", uts_ns);
@@ -326,8 +360,8 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 		char ipc_ns[PATH_MAX] = { '\0' };
 		sprintf(ipc_ns, "/proc/%d/ns/ipc", container->ns_pid);
 		int ipc_ns_fd = open(ipc_ns, O_RDONLY | O_CLOEXEC);
-		if (ipc_ns_fd < 0 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that ipc namespace is not supported on this device QwQ{clear}\n");
+		if (ipc_ns_fd < 0) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that ipc namespace is not supported on this device QwQ{clear}\n");
 		} else {
 			if (setns(ipc_ns_fd, CLONE_NEWIPC) == -1) {
 				ruri_error("{red}Failed to setns(2) to %s\n", ipc_ns);
@@ -337,8 +371,8 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 		char cgroup_ns[PATH_MAX] = { '\0' };
 		sprintf(cgroup_ns, "/proc/%d/ns/cgroup", container->ns_pid);
 		int cgroup_ns_fd = open(cgroup_ns, O_RDONLY | O_CLOEXEC);
-		if (cgroup_ns_fd < 0 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that cgroup namespace is not supported on this device QwQ{clear}\n");
+		if (cgroup_ns_fd < 0) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that cgroup namespace is not supported on this device QwQ{clear}\n");
 		} else {
 			if (setns(cgroup_ns_fd, CLONE_NEWCGROUP) == -1) {
 				ruri_error("{red}Failed to setns(2) to %s\n", cgroup_ns);
@@ -348,8 +382,8 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 		char time_ns[PATH_MAX] = { '\0' };
 		sprintf(time_ns, "/proc/%d/ns/time", container->ns_pid);
 		int time_ns_fd = open(time_ns, O_RDONLY | O_CLOEXEC);
-		if (time_ns_fd < 0 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that time namespace is not supported on this device QwQ{clear}\n");
+		if (time_ns_fd < 0) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that time namespace is not supported on this device QwQ{clear}\n");
 		} else {
 			if (setns(time_ns_fd, CLONE_NEWTIME) == -1) {
 				ruri_error("{red}Failed to setns(2) to %s\n", time_ns);
@@ -357,31 +391,33 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 		}
 		close(time_ns_fd);
 		// Join net ns.
-		// This action will be forced, and will not error.
+		// This action will be forced.
 		char net_ns_file[PATH_MAX] = { '\0' };
 		sprintf(net_ns_file, "%s%d%s", "/proc/", container->ns_pid, "/ns/net");
 		int net_ns_fd = open(net_ns_file, O_RDONLY | O_CLOEXEC);
-		setns(net_ns_fd, CLONE_NEWNET);
+		if (setns(net_ns_fd, CLONE_NEWNET) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that network namespace is not supported on this device QwQ{clear}\n");
+		}
 	} else {
 		// We need to own mount namespace.
 		try_unshare(CLONE_NEWNS);
 		// Seems we need to own a new pid namespace for mount procfs.
 		try_unshare(CLONE_NEWPID);
-		if (unshare(CLONE_NEWUTS) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that uts namespace is not supported on this device QwQ{clear}\n");
+		if (unshare(CLONE_NEWUTS) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that uts namespace is not supported on this device QwQ{clear}\n");
 		}
-		if (unshare(CLONE_NEWIPC) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that ipc namespace is not supported on this device QwQ{clear}\n");
+		if (unshare(CLONE_NEWIPC) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that ipc namespace is not supported on this device QwQ{clear}\n");
 		}
-		if (unshare(CLONE_NEWCGROUP) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that cgroup namespace is not supported on this device QwQ{clear}\n");
+		if (unshare(CLONE_NEWCGROUP) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that cgroup namespace is not supported on this device QwQ{clear}\n");
 		}
 		if (unshare(CLONE_NEWTIME) == -1) {
 			if (container->timens_realtime_offset != 0 || container->timens_monotonic_offset != 0) {
 				ruri_error("{red}Failed to unshare time namespace QwQ\n");
 			}
 			if (container->no_warnings) {
-				ruri_warning("{yellow}Warning: seems that time namespace is not supported on this device QwQ{clear}\n");
+				ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that time namespace is not supported on this device QwQ{clear}\n");
 			}
 		}
 		if (container->timens_monotonic_offset != 0) {
@@ -399,14 +435,14 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 			write(fd, buf, strlen(buf));
 			close(fd);
 		}
-		if (unshare(CLONE_SYSVSEM) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that semaphore namespace is not supported on this device QwQ{clear}\n");
+		if (unshare(CLONE_SYSVSEM) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that semaphore namespace is not supported on this device QwQ{clear}\n");
 		}
-		if (unshare(CLONE_FILES) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that we could not unshare file descriptors with child process QwQ{clear}\n");
+		if (unshare(CLONE_FILES) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that we could not unshare file descriptors with child process QwQ{clear}\n");
 		}
-		if (unshare(CLONE_FS) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: seems that we could not unshare filesystem information with child process QwQ{clear}\n");
+		if (unshare(CLONE_FS) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: seems that we could not unshare filesystem information with child process QwQ{clear}\n");
 		}
 		if (container->no_network) {
 			if (unshare(CLONE_NEWNET) == -1) {
@@ -417,8 +453,8 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 	// fork(2) into new namespaces we created.
 	pid_t pid = fork();
 	if (pid > 0) {
-		if (!set_id_map_succeed && !container->no_warnings) {
-			ruri_warning("{yellow}Check if uidmap is installed and /etc/subuid and /etc/subgid are configured on your host, command like su will run failed without uidmap.\n");
+		if (!set_id_map_succeed) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Check if uidmap is installed and /etc/subuid and /etc/subgid are configured on your host, command like su will run failed without uidmap.\n");
 			set_id_map(uid, gid);
 		}
 		usleep(1000);
@@ -427,7 +463,7 @@ void ruri_run_rootless_container(struct RURI_CONTAINER *_Nonnull container)
 			ruri_store_info(container);
 		} else {
 			if (!container->no_warnings && !container_initlized) {
-				ruri_warning("{base}NS PID:{green} %d\n", container->ns_pid);
+				ruri_warn_on_error(1, 0, !container->no_warnings, "{base}NS PID:{green} %d\n", container->ns_pid);
 			}
 		}
 		// Wait for child process to exit.

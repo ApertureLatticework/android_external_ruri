@@ -48,33 +48,36 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <limits.h>
+#include <linux/fs.h>
 #include <linux/limits.h>
+#include <linux/loop.h>
 #include <linux/sched.h>
 #include <linux/securebits.h>
 #include <linux/version.h>
-#include <linux/loop.h>
-#include <sys/mount.h>
-#include <linux/fs.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
-#include <sys/sendfile.h>
-#include <sys/prctl.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
-#include <sys/types.h>
-#include <sys/utsname.h>
-#include <sys/wait.h>
-#include <sys/time.h>
-#include <time.h>
-#include <signal.h>
-#include <unistd.h>
+#include <linux/magic.h>
+#include <sys/statfs.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <grp.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 #ifndef DISABLE_LIBSECCOMP
 // This program need to be linked with `-lseccomp`.
 #include <seccomp.h>
@@ -92,6 +95,18 @@ typedef int cap_value_t;
 // Fix definition of LOGIN_NAME_MAX
 #ifndef LOGIN_NAME_MAX
 #define LOGIN_NAME_MAX 256
+#endif
+// Fix definition of CGROUP2_SUPER_MAGIC
+#ifndef CGROUP2_SUPER_MAGIC
+#define CGROUP2_SUPER_MAGIC 0x63677270
+#endif
+// Fix definition of TMPFS_MAGIC
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x01021994
+#endif
+// Fix definition of PROC_SUPER_MAGIC
+#ifndef PROC_SUPER_MAGIC
+#define PROC_SUPER_MAGIC 0x9fa0
 #endif
 // Nullability attributes.
 #ifndef _Nullable
@@ -125,9 +140,9 @@ typedef int cap_value_t;
 #undef NGROUPS_MAX
 #define NGROUPS_MAX 65536
 // Include other headers.
-#include "version.h"
-#include "k2v.h"
 #include "cprintf.h"
+#include "k2v.h"
+#include "version.h"
 #undef cprintf
 #undef cfprintf
 #define cprintf(format, ...) scprintf(format, ##__VA_ARGS__)
@@ -212,6 +227,7 @@ struct RURI_CONTAINER {
 	bool skip_setgroups;
 	// First init.
 	bool first_init;
+	bool systemd_mode;
 };
 // For ruri_get_magic().
 #define ruri_magicof(x) (x##_magic)
@@ -230,15 +246,15 @@ struct RURI_ID_MAP {
 	gid_t gid_count;
 };
 // Warnings.
-#define ruri_warning(format, ...)                                                                \
-	{                                                                                        \
-		cfprintf(stderr, "{yellow}at %s() at %d at %s: ", __func__, __LINE__, __FILE__); \
-		cfprintf(stderr, format, ##__VA_ARGS__);                                         \
-	}
+#define ruri_warning(format, ...)                                                                  \
+	do {                                                                                       \
+		cfprintf(stderr, "{yellow}in %s() at %s line %d: ", __func__, __FILE__, __LINE__); \
+		cfprintf(stderr, format, ##__VA_ARGS__);                                           \
+	} while (0)
 // Show error msg and exit.
 #define ruri_error(format, ...)                                                                                                                      \
-	{                                                                                                                                            \
-		cfprintf(stderr, "{red}In %s() in %s line %d:\n", __func__, __FILE__, __LINE__);                                                     \
+	do {                                                                                                                                         \
+		cfprintf(stderr, "{red}in %s() at %s line %d:\n", __func__, __FILE__, __LINE__);                                                     \
 		cfprintf(stderr, format, ##__VA_ARGS__);                                                                                             \
 		cfprintf(stderr, "{base}%s{clear}\n", "\n  .^.   .^.");                                                                              \
 		cfprintf(stderr, "{base}%s{clear}\n", "  /⋀\\_ﾉ_/⋀\\");                                                                              \
@@ -249,18 +265,38 @@ struct RURI_ID_MAP {
 		cfprintf(stderr, "{base}%s{clear}\n", "RURI ERROR MESSAGE");                                                                         \
 		cfprintf(stderr, "{base}%s{clear}\n", "Note: for some configs, you might need to run `-U` to umount container before changing it."); \
 		cfprintf(stderr, "{base}%s{clear}\n", "If you think something is wrong, please report at:");                                         \
-		cfprintf(stderr, "\033[4m{base}%s{clear}\n", "https://github.com/Moe-hacker/ruri/issues");                                           \
+		cfprintf(stderr, "\033[4m{base}%s{clear}\n", "https://github.com/rurioss/ruri/issues");                                              \
 		exit(114);                                                                                                                           \
-	}
+	} while (0)
+#define ruri_panic_on_error(ret__, expect__, format__, ...)  \
+	do {                                                 \
+		if (ret__ != expect__) {                     \
+			ruri_error(format__, ##__VA_ARGS__); \
+		}                                            \
+	} while (0)
+extern bool ruri_force_panic;
+#define ruri_warn_on_error(ret__, expect__, show__, format__, ...)                         \
+	do {                                                                               \
+		if (ret__ != expect__) {                                                   \
+			if (ruri_force_panic) {                                            \
+				ruri_warning(format__, ##__VA_ARGS__);                     \
+				ruri_error("{red}Force panic is enabled, exiting now.\n"); \
+			} else {                                                           \
+				if (show__) {                                              \
+					ruri_warning(format__, ##__VA_ARGS__);             \
+				}                                                          \
+			}                                                                  \
+		}                                                                          \
+	} while (0)
 // Log system.
 #if defined(RURI_DEBUG)
 #define ruri_log(format, ...)                                                                                                         \
-	{                                                                                                                             \
+	do {                                                                                                                          \
 		struct timeval tv;                                                                                                    \
 		gettimeofday(&tv, NULL);                                                                                              \
-		cfprintf(stderr, "{green}[%ld.%06ld] in %s() in %s line %d:\n", tv.tv_sec, tv.tv_usec, __func__, __FILE__, __LINE__); \
+		cfprintf(stderr, "{green}[%ld.%06ld] in %s() at %s line %d:\n", tv.tv_sec, tv.tv_usec, __func__, __FILE__, __LINE__); \
 		cfprintf(stderr, format, ##__VA_ARGS__);                                                                              \
-	}
+	} while (0)
 #else
 #define ruri_log(format, ...)
 #endif
@@ -291,7 +327,7 @@ void ruri_read_config(struct RURI_CONTAINER *_Nonnull container, const char *_No
 void ruri_set_limit(const struct RURI_CONTAINER *_Nonnull container);
 struct RURI_ID_MAP ruri_get_idmap(uid_t uid, gid_t gid);
 void ruri_container_ps(char *_Nonnull container_dir);
-void ruri_kill_container(const char *_Nonnull container_dir);
+void ruri_kill_container(struct RURI_CONTAINER *_Nonnull container);
 bool ruri_user_exist(const char *_Nonnull username);
 uid_t ruri_get_user_uid(const char *_Nonnull username);
 gid_t ruri_get_user_gid(const char *_Nonnull username);
@@ -300,6 +336,7 @@ void ruri_correct_config(const char *_Nonnull path);
 void ruri_init_config(struct RURI_CONTAINER *_Nonnull container);
 int ruri_mkdirs(const char *_Nonnull dir, mode_t mode);
 int ruri_get_groups(uid_t uid, gid_t groups[]);
+int ruri_try_cgroup_kill(const struct RURI_CONTAINER *_Nonnull container);
 #ifndef DISABLE_LIBCAP
 int ruri_cap_from_name(const char *str, cap_value_t *cap);
 #endif

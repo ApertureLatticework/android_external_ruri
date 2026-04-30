@@ -74,8 +74,9 @@ void ruri_setup_seccomp(const struct RURI_CONTAINER *_Nonnull container)
 			if (ruri_resolve_seccomp_errno(container->seccomp_denied_syscall[i], &ctx) != 0) {
 				ruri_error("Failed to resolve syscall: %s\n", container->seccomp_denied_syscall[i]);
 			}
+		} else {
+			seccomp_rule_add(ctx, SCMP_ACT_KILL, syscall_nr, 0);
 		}
-		seccomp_rule_add(ctx, SCMP_ACT_KILL, syscall_nr, 0);
 	}
 	// Default rules.
 	if (container->enable_default_seccomp) {
@@ -83,6 +84,8 @@ void ruri_setup_seccomp(const struct RURI_CONTAINER *_Nonnull container)
 		if (ruri_is_in_caplist(container->drop_caplist, CAP_SYS_PACCT)) {
 			seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(acct), 0);
 		}
+		// Disallow AF_ALG.
+		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 1, SCMP_CMP(0, SCMP_CMP_EQ, AF_ALG));
 		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(add_key), 0);
 		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(bpf), 0);
 		if (ruri_is_in_caplist(container->drop_caplist, CAP_SYS_ADMIN)) {
@@ -102,6 +105,7 @@ void ruri_setup_seccomp(const struct RURI_CONTAINER *_Nonnull container)
 			for (size_t i = 0; i < sizeof(clone_flags) / sizeof(clone_flags[0]); i++) {
 				seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 1, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, clone_flags[i], clone_flags[i]));
 			}
+			seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0);
 			seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(vm86), 0);
 			seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(vm86old), 0);
 		}
@@ -158,7 +162,6 @@ void ruri_setup_seccomp(const struct RURI_CONTAINER *_Nonnull container)
 		if (ruri_is_in_caplist(container->drop_caplist, CAP_SYS_CHROOT)) {
 			seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(chroot), 0);
 		}
-	}
 #else
 		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(acct), 0);
 		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(add_key), 0);
@@ -218,12 +221,29 @@ void ruri_setup_seccomp(const struct RURI_CONTAINER *_Nonnull container)
 		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(userfaultfd), 0);
 		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(ustat), 0);
 		seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(chroot), 0);
-	}
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0);
 #endif
+	}
+	if (container->systemd_mode) {
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(kexec_load), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(open_by_handle_at), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(init_module), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(delete_module), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(finit_module), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(kexec_file_load), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(reboot), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(umount2), 1, SCMP_CMP(5, SCMP_CMP_MASKED_EQ, MNT_FORCE, MNT_FORCE));
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(keyctl), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(add_key), 0);
+		seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(request_key), 0);
+	}
 	// Disable no_new_privs bit by default.
 	seccomp_attr_set(ctx, SCMP_FLTATR_CTL_NNP, 0);
 	// Load seccomp rules.
-	seccomp_load(ctx);
+	if (seccomp_load(ctx) != 0) {
+		ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: failed to load seccomp filter QwQ{clear}\n");
+	}
 	ruri_log("{base}Seccomp filter loaded\n");
 #endif
 }

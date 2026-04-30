@@ -42,7 +42,9 @@ static bool su_biany_exist(char *_Nonnull container_dir)
 	 * so we need to check it.
 	 */
 	char su_path[PATH_MAX] = { '\0' };
-	sprintf(su_path, "%s/bin/su", container_dir);
+	if (snprintf(su_path, sizeof(su_path), "%s/bin/su", container_dir) >= (int)sizeof(su_path)) {
+		return false;
+	}
 	int fd = open(su_path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		return false;
@@ -65,7 +67,9 @@ static bool busybox_exists(char *_Nonnull container_dir)
 	 * Check if busybox exists in container.
 	 */
 	char busybox_path[PATH_MAX] = { '\0' };
-	sprintf(busybox_path, "%s/bin/busybox", container_dir);
+	if (snprintf(busybox_path, sizeof(busybox_path), "%s/bin/busybox", container_dir) >= (int)sizeof(busybox_path)) {
+		return false;
+	}
 	int fd = open(busybox_path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		return false;
@@ -100,8 +104,10 @@ static void check_binary(const struct RURI_CONTAINER *_Nonnull container)
 		}
 		// Check if QEMU binary exists and is not a directory.
 		char qemu_binary[PATH_MAX];
-		strcpy(qemu_binary, container->container_dir);
-		strcat(qemu_binary, container->qemu_path);
+		if (snprintf(qemu_binary, sizeof(qemu_binary), "%s%s", container->container_dir, container->qemu_path) >= (int)sizeof(qemu_binary)) {
+			ruri_umount_container(container->container_dir);
+			ruri_error("{red}Error: QEMU binary path is too long QwQ\n");
+		}
 		struct stat qemu_binary_stat;
 		// lstat(3) will return -1 while the init_binary does not exist.
 		if (lstat(qemu_binary, &qemu_binary_stat) != 0) {
@@ -110,6 +116,104 @@ static void check_binary(const struct RURI_CONTAINER *_Nonnull container)
 		}
 	}
 }
+/*
+ * Generate a unique machine-id for systemd.
+ */
+static void generate_machine_id(int container_id)
+{
+	ruri_log("{blue}Generating unique machine-id for systemd.\n");
+	char new_machine_id[33];
+	const char *hex_chars = "0123456789abcdef";
+	srand((unsigned int)container_id);
+	for (int i = 0; i < 32; i++) {
+		new_machine_id[i] = hex_chars[rand() % 16];
+	}
+	new_machine_id[32] = '\0';
+	remove("/etc/machine-id");
+	unlink("/etc/machine-id");
+	int machine_id_fd = open("/etc/machine-id", O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	if (machine_id_fd >= 0) {
+		write(machine_id_fd, new_machine_id, 32);
+		write(machine_id_fd, "\n", 1);
+		close(machine_id_fd);
+		ruri_log("{blue}Generated /etc/machine-id: %s\n", new_machine_id);
+	}
+}
+
+/*
+ * Move PID 1 into a dedicated cgroup subtree before execing systemd.
+ * This avoids inheriting an invalid parent cgroup such as /init.
+ */
+static void prepare_systemd_cgroup_scope(const struct RURI_CONTAINER *_Nonnull container)
+{
+	char scope_dir[PATH_MAX] = { 0 };
+	char scope_procs[PATH_MAX] = { 0 };
+	char pid_buf[64] = { 0 };
+
+	snprintf(scope_dir, sizeof(scope_dir), "/sys/fs/cgroup/ruri-%d", container->container_id);
+	snprintf(scope_procs, sizeof(scope_procs), "%s/cgroup.procs", scope_dir);
+
+	if (mkdir(scope_dir, 0755) < 0 && errno != EEXIST) {
+		ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to create systemd cgroup scope %s: %s\n", scope_dir, strerror(errno));
+		return;
+	}
+
+	int fd = open(scope_procs, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to open %s: %s\n", scope_procs, strerror(errno));
+		return;
+	}
+
+	snprintf(pid_buf, sizeof(pid_buf), "%d\n", getpid());
+	if (write(fd, pid_buf, strlen(pid_buf)) < 0) {
+		ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to move systemd pid into %s: %s\n", scope_dir, strerror(errno));
+	}
+	close(fd);
+}
+
+/*
+ * Setup complete systemd runtime environment.
+ * This includes all directories and files systemd needs to function.
+ */
+static void setup_systemd_runtime(struct RURI_CONTAINER *_Nonnull container)
+{
+	// Mount tmpfs for runtime directories.
+	mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
+	mkdir("/run/lock", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
+	mount("tmpfs", "/run/lock", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
+	mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
+
+	// Create systemd runtime directories.
+	mkdir("/run/systemd", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
+	mkdir("/run/systemd/system", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
+	remove("/run/systemd/container");
+	unlink("/run/systemd/container");
+	int systemd_container_config_fd = open("/run/systemd/container", O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+	if (systemd_container_config_fd >= 0) {
+		write(systemd_container_config_fd, "ruri", strlen("ruri"));
+		close(systemd_container_config_fd);
+		ruri_log("{blue}Setup /run/systemd/container for systemd runtime.\n");
+		ruri_log("{blue}systemd will treat this container as a docker container, which is good for compatibility.\n");
+	} else {
+		ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Failed to setup /run/systemd/container\n");
+	}
+	// Create journal runtime directory.
+	mkdir("/run/log", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
+	mkdir("/run/log/journal", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
+
+	// Create dbus runtime directory.
+	int res = mkdir("/run/dbus", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
+	ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /run/dbus, dbus service may not work.\n");
+
+	// Ensure /var/run points to /run for dbus compatibility.
+	if (access("/var/run", F_OK) != 0) {
+		symlink("/run", "/var/run");
+	}
+
+	// Setup /etc/machine-id
+	generate_machine_id(container->container_id);
+}
+
 // Run after chroot(2), called by ruri_run_chroot_container().
 static void init_container(struct RURI_CONTAINER *_Nonnull container)
 {
@@ -118,26 +222,38 @@ static void init_container(struct RURI_CONTAINER *_Nonnull container)
 	 * The device list and permissions are based on common docker containers.
 	 * If -A is not set, we will mask some dirs in /sys and /proc to avoid security issues.
 	 */
-	// If /proc/1 exists, that means container is already initialized.
-	// I used to check /sys/class/input, but in WSL1, /sys/class/input is not exist.
-	// But /proc/1 is exist in all Linux systems, because it's the init process.
-	char *test = realpath("/proc/1", NULL);
-	if (test == NULL) {
+	bool proc_mounted = false;
+	// Use statfs() to ensure /proc is procfs.
+	struct statfs proc_statfs;
+	if (statfs("/proc", &proc_statfs) == 0 && proc_statfs.f_type == PROC_SUPER_MAGIC) {
+		proc_mounted = true;
+	}
+	if (!proc_mounted) {
+		container->first_init = true;
+		ruri_log("{blue}Container is not initialized, initializing...\n");
+		int res = 0;
 		// Mount proc,sys and dev.
 		mkdir("/sys", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
 		mkdir("/proc", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
 		mkdir("/dev", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
 		if (container->ro_root) {
-			mount("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_RDONLY, NULL);
-			mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_RDONLY, NULL);
+			res = mount("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_RDONLY, NULL);
+			ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount procfs as read-only, will continue.\n");
+			res = mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_RDONLY, NULL);
+			ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount sysfs as read-only, will continue.\n");
 		} else {
-			mount("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
-			mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
+			res = mount("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
+			ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount procfs, will continue.\n");
+			res = mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
+			ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount sysfs, will continue.\n");
 		}
-		mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "size=65536k,mode=755");
+		res = mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "size=65536k,mode=755");
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount devtmpfs, will continue.\n");
 		// Continue mounting some other directories in /dev.
-		mkdir("/dev/pts", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
-		mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "gid=5,mode=620,ptmxmode=666,max=1024");
+		res = mkdir("/dev/pts", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/pts, will continue.\n");
+		res = mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "gid=5,mode=620,ptmxmode=666,max=1024");
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount devpts, will continue.\n");
 		char *devshm_options = NULL;
 		if (container->memory == NULL) {
 			devshm_options = strdup("mode=1777");
@@ -145,34 +261,39 @@ static void init_container(struct RURI_CONTAINER *_Nonnull container)
 			devshm_options = malloc(strlen(container->memory) + strlen("mode=1777") + 114);
 			sprintf(devshm_options, "size=65536k,mode=1777");
 		}
-		mkdir("/dev/shm", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
-		mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, devshm_options);
+		res = mkdir("/dev/shm", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/shm, will continue.\n");
+		res = mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, devshm_options);
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount /dev/shm, will continue.\n");
 		usleep(1000);
 		free(devshm_options);
 		// Mount binfmt_misc.
-		mount("binfmt_misc", "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, NULL);
+		res = mount("binfmt_misc", "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, NULL);
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to mount binfmt_misc, will continue.\n");
 		// Create system runtime files in /dev and then fix permissions.
-		mknod("/dev/null", S_IFCHR, makedev(1, 3));
+		res = mknod("/dev/null", S_IFCHR, makedev(1, 3));
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/null, will continue.\n");
 		chmod("/dev/null", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-		mknod("/dev/console", S_IFCHR, makedev(5, 0));
-		chown("/dev/console", 0, 5);
-		chmod("/dev/console", S_IRUSR | S_IWUSR | S_IWGRP | S_IWOTH);
-		mknod("/dev/zero", S_IFCHR, makedev(1, 5));
+		res = mknod("/dev/zero", S_IFCHR, makedev(1, 5));
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/zero, will continue.\n");
 		chmod("/dev/zero", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-		mknod("/dev/ptmx", S_IFCHR, makedev(5, 2));
+		res = mknod("/dev/ptmx", S_IFCHR, makedev(5, 2));
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/ptmx, will continue.\n");
 		chown("/dev/ptmx", 0, 5);
 		chmod("/dev/ptmx", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-		mknod("/dev/tty", S_IFCHR, makedev(5, 0));
-		chown("/dev/tty", 0, 5);
-		chmod("/dev/tty", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-		mknod("/dev/random", S_IFCHR, makedev(1, 8));
+		res = mknod("/dev/random", S_IFCHR, makedev(1, 8));
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/random, will continue.\n");
 		chmod("/dev/random", S_IRUSR | S_IRGRP | S_IROTH);
-		mknod("/dev/urandom", S_IFCHR, makedev(1, 9));
+		res = mknod("/dev/urandom", S_IFCHR, makedev(1, 9));
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/urandom, will continue.\n");
 		chmod("/dev/urandom", S_IRUSR | S_IRGRP | S_IROTH);
-		mkdir("/dev/net", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
-		mknod("/dev/net/tun", S_IFCHR, makedev(10, 200));
+		res = mkdir("/dev/net", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/net, will continue.\n");
+		res = mknod("/dev/net/tun", S_IFCHR, makedev(10, 200));
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/net/tun, will continue.\n");
 		if (container->use_kvm) {
-			mknod("/dev/kvm", S_IFCHR, makedev(10, 232));
+			res = mknod("/dev/kvm", S_IFCHR, makedev(10, 232));
+			ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create /dev/kvm, will continue.\n");
 			chmod("/dev/kvm", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
 		}
 		// Create some system runtime link files in /dev.
@@ -180,20 +301,18 @@ static void init_container(struct RURI_CONTAINER *_Nonnull container)
 		symlink("/proc/self/fd/0", "/dev/stdin");
 		symlink("/proc/self/fd/1", "/dev/stdout");
 		symlink("/proc/self/fd/2", "/dev/stderr");
-		mknod("/dev/tty0", S_IFCHR, makedev(5, 0));
-		chown("/dev/tty0", 0, 5);
-		chmod("/dev/tty0", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-		if (false) {
-			mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
-			mkdir("/run/lock", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
-			mount("tmpfs", "/run/lock", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
-			mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
-			mkdir("/run/systemd", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
-			int systemd_container_config_fd = open("/run/systemd/container", O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
-			if (systemd_container_config_fd >= 0) {
-				write(systemd_container_config_fd, "ruri", strlen("ruri"));
-				close(systemd_container_config_fd);
-			}
+		remove("/dev/console");
+		unlink("/dev/console");
+		symlink("/dev/null", "/dev/console");
+		remove("/dev/tty0");
+		unlink("/dev/tty0");
+		symlink("/dev/null", "/dev/tty0");
+		remove("/dev/tty");
+		unlink("/dev/tty");
+		symlink("/dev/null", "/dev/tty");
+		// Setup systemd runtime environment
+		if (container->systemd_mode) {
+			setup_systemd_runtime(container);
 		}
 		if (!container->unmask_dirs) {
 			// Mask some directories/files that we don't want the container modify it.
@@ -213,7 +332,9 @@ static void init_container(struct RURI_CONTAINER *_Nonnull container)
 			mount("tmpfs", "/sys/kernel/debug", "tmpfs", MS_RDONLY, NULL);
 			mount("tmpfs", "/sys/module", "tmpfs", MS_RDONLY, NULL);
 			mount("tmpfs", "/sys/class/net", "tmpfs", MS_RDONLY, NULL);
-			mount("tmpfs", "/sys/fs/cgroup", "tmpfs", MS_RDONLY, NULL);
+			if (!container->systemd_mode) {
+				mount("tmpfs", "/sys/fs/cgroup", "tmpfs", MS_RDONLY, NULL);
+			}
 			// Protect some system runtime directories by mounting themselves as read-only.
 			mount("/proc/bus", "/proc/bus", NULL, MS_BIND | MS_REC, NULL);
 			mount("/proc/bus", "/proc/bus", NULL, MS_BIND | MS_RDONLY | MS_REMOUNT, NULL);
@@ -225,32 +346,43 @@ static void init_container(struct RURI_CONTAINER *_Nonnull container)
 			mount("/proc/sys", "/proc/sys", NULL, MS_BIND | MS_RDONLY | MS_REMOUNT, NULL);
 			mount("/proc/sys-trigger", "/proc/sys-trigger", NULL, MS_BIND | MS_REC, NULL);
 			mount("/proc/sys-trigger", "/proc/sys-trigger", NULL, MS_BIND | MS_RDONLY | MS_REMOUNT, NULL);
+			mount("/dev/null", "/sys/class/tty/console/active", NULL, MS_BIND, NULL);
 		}
 		// Mask other user-specified path.
 		for (int i = 0; i < RURI_MAX_MOUNTPOINTS; i++) {
 			if (container->masked_path[i] == NULL) {
 				break;
 			}
+			int res1, res2;
 			// try to mask with ro tmpfs.
-			mount("tmpfs", container->masked_path[i], "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_RDONLY, NULL);
+			res1 = mount("tmpfs", container->masked_path[i], "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_RDONLY, NULL);
 			// Try to mask with /dev/null.
 			mount("/dev/null", container->masked_path[i], NULL, MS_BIND, NULL);
-			mount("/dev/null", container->masked_path[i], NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL);
+			res2 = mount("/dev/null", container->masked_path[i], NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL);
+			ruri_warn_on_error((res1 == 0 || res2 == 0), true, !container->no_warnings, "{yellow}Warning: Failed to mask %s as read-only.\n", container->masked_path[i]);
 		}
 	} else {
-		free(test);
+		container->first_init = false;
+		ruri_log("{blue}Container is already initialized, skipping initialization.\n");
 	}
 }
 static void mk_char_devs(struct RURI_CONTAINER *_Nonnull container)
 {
-	chdir("/dev");
+	if (chdir("/dev") == -1) {
+		if (container->char_devs[0] == NULL) {
+			return;
+		}
+		ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to chdir(2) to /dev, will not create char devices.\n");
+		return;
+	}
 	for (int i = 0; true; i += 3) {
 		if (container->char_devs[i] == NULL) {
 			break;
 		}
 		ruri_mkdirs(container->char_devs[i], 0666);
 		rmdir(container->char_devs[i]);
-		mknod(container->char_devs[i], S_IFCHR, makedev((unsigned int)atoi(container->char_devs[i + 1]), (unsigned int)atoi(container->char_devs[i + 2])));
+		int res = mknod(container->char_devs[i], S_IFCHR, makedev((unsigned int)atoi(container->char_devs[i + 1]), (unsigned int)atoi(container->char_devs[i + 2])));
+		ruri_warn_on_error(res, 0, !container->no_warnings, "{yellow}Warning: Failed to create char device %s, will continue.\n", container->char_devs[i]);
 		chmod(container->char_devs[i], S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
 	}
 	chdir("/");
@@ -270,23 +402,33 @@ static void mount_host_runtime(const struct RURI_CONTAINER *_Nonnull container)
 	char buf[PATH_MAX] = { '\0' };
 	// Mount /dev.
 	memset(buf, '\0', sizeof(buf));
-	sprintf(buf, "%s/dev", container->container_dir);
+	if (snprintf(buf, sizeof(buf), "%s/dev", container->container_dir) >= (int)sizeof(buf)) {
+		return;
+	}
 	mount("/dev", buf, NULL, MS_BIND, NULL);
 	// mount /proc.
 	memset(buf, '\0', sizeof(buf));
-	sprintf(buf, "%s/proc", container->container_dir);
+	if (snprintf(buf, sizeof(buf), "%s/proc", container->container_dir) >= (int)sizeof(buf)) {
+		return;
+	}
 	mount("/proc", buf, NULL, MS_BIND, NULL);
 	// Mount /sys.
 	memset(buf, '\0', sizeof(buf));
-	sprintf(buf, "%s/sys", container->container_dir);
+	if (snprintf(buf, sizeof(buf), "%s/sys", container->container_dir) >= (int)sizeof(buf)) {
+		return;
+	}
 	mount("/sys", buf, NULL, MS_BIND, NULL);
 	// Mount binfmt_misc.
 	memset(buf, '\0', sizeof(buf));
-	sprintf(buf, "%s/proc/sys/fs/binfmt_misc", container->container_dir);
+	if (snprintf(buf, sizeof(buf), "%s/proc/sys/fs/binfmt_misc", container->container_dir) >= (int)sizeof(buf)) {
+		return;
+	}
 	mount("binfmt_misc", buf, "binfmt_misc", 0, NULL);
 	// Mount devpts.
 	memset(buf, '\0', sizeof(buf));
-	sprintf(buf, "%s/dev/pts", container->container_dir);
+	if (snprintf(buf, sizeof(buf), "%s/dev/pts", container->container_dir) >= (int)sizeof(buf)) {
+		return;
+	}
 	mkdir(buf, S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
 	mount("/dev/pts", buf, "none", MS_BIND, NULL);
 	// Mount devshm.
@@ -298,7 +440,10 @@ static void mount_host_runtime(const struct RURI_CONTAINER *_Nonnull container)
 		sprintf(devshm_options, "size=%s,mode=1777", container->memory);
 	}
 	memset(buf, '\0', sizeof(buf));
-	sprintf(buf, "%s/dev/shm", container->container_dir);
+	if (snprintf(buf, sizeof(buf), "%s/dev/shm", container->container_dir) >= (int)sizeof(buf)) {
+		free(devshm_options);
+		return;
+	}
 	mkdir(buf, S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
 	mount("tmpfs", buf, "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, devshm_options);
 	usleep(1000);
@@ -323,9 +468,9 @@ static void drop_caps(const struct RURI_CONTAINER *_Nonnull container)
 		// so that we can avoid unnecessary warnings.
 		if (CAP_IS_SUPPORTED(container->drop_caplist[i])) {
 			// Drop CapBnd.
-			if (cap_drop_bound(container->drop_caplist[i]) != 0 && !container->no_warnings) {
-				ruri_warning("{yellow}Warning: Failed to drop cap `%s`\n", cap_to_name(container->drop_caplist[i]));
-				ruri_warning("{yellow}error reason: %s{clear}\n", strerror(errno));
+			if (cap_drop_bound(container->drop_caplist[i]) != 0) {
+				ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to drop cap `%s`\n", cap_to_name(container->drop_caplist[i]));
+				ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}error reason: %s{clear}\n", strerror(errno));
 			}
 			// Drop CapAmb.
 			prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, container->drop_caplist[i], 0, 0);
@@ -380,13 +525,13 @@ static void setup_binfmt_misc(const struct RURI_CONTAINER *_Nonnull container)
 	struct RURI_ELF_MAGIC *magic = ruri_get_magic(container->cross_arch);
 	// Umount container if we get an error.
 	if (magic == NULL) {
-		ruri_warning("{red}Error: unknown architecture or same architecture as host: %s\n\nSupported architectures: aarch64, alpha, arm, armeb, cris, hexagon, hppa, i386, loongarch64, m68k, microblaze, mips, mips64, mips64el, mipsel, mipsn32, mipsn32el, ppc, ppc64, ppc64le, riscv32, riscv64, s390x, sh4, sh4eb, sparc, sparc32plus, sparc64, x86_64, xtensa, xtensaeb{clear}\n", container->cross_arch);
-		ruri_umount_container(container->container_dir);
-		ruri_error(" ");
+		ruri_error("{red}Error: unknown architecture or same architecture as host: %s\n\nSupported architectures: aarch64, alpha, arm, armeb, cris, hexagon, hppa, i386, loongarch64, m68k, microblaze, mips, mips64, mips64el, mipsel, mipsn32, mipsn32el, ppc, ppc64, ppc64le, riscv32, riscv64, s390x, sh4, sh4eb, sparc, sparc32plus, sparc64, x86_64, xtensa, xtensaeb{clear}\n", container->cross_arch);
 	}
 	char buf[1024] = { '\0' };
 	// Format: ":name:type:offset:magic:mask:interpreter:flags".
-	sprintf(buf, ":%s%d:M:0:%s:%s:%s:PCF", "ruri-", container->container_id, magic->magic, magic->mask, container->qemu_path);
+	if (snprintf(buf, sizeof(buf), ":%s%d:M:0:%s:%s:%s:PCF", "ruri-", container->container_id, magic->magic, magic->mask, container->qemu_path) >= (int)sizeof(buf)) {
+		ruri_error("{red}Error: binfmt_misc registration string is too long QwQ\n");
+	}
 	// Just to make clang-tidy happy.
 	free(magic);
 	// This needs CONFIG_BINFMT_MISC enabled in your kernel.
@@ -473,7 +618,10 @@ static void copy_qemu_binary(struct RURI_CONTAINER *container)
 	// Copy qemu binary into container.
 	if (qemu_path != NULL) {
 		char target[PATH_MAX] = { '\0' };
-		sprintf(target, "%s/qemu-ruri", container->container_dir);
+		if (snprintf(target, sizeof(target), "%s/qemu-ruri", container->container_dir) >= (int)sizeof(target)) {
+			free(qemu_path);
+			ruri_error("{red}Error: container directory path is too long QwQ\n");
+		}
 		unlink(target);
 		remove(target);
 		rmdir(target);
@@ -513,7 +661,9 @@ static bool pivot_root_succeed(const char *_Nonnull container_dir)
 	if (chdir(container_dir) != 0) {
 		return true;
 	}
-	sprintf(dev_null, "%s/./dev/null", container_dir);
+	if (snprintf(dev_null, sizeof(dev_null), "%s/./dev/null", container_dir) >= (int)sizeof(dev_null)) {
+		return true;
+	}
 	if (stat(dev_null, &dev_null_stat) != 0) {
 		return true;
 	}
@@ -541,9 +691,7 @@ static int try_pivot_root(const struct RURI_CONTAINER *_Nonnull container)
 	chdir(container->container_dir);
 	if (syscall(SYS_pivot_root, ".", ".") == -1) {
 		ruri_log("{base}pivot_root(2) failed, using chroot(2) instead.\n");
-		if (!container->no_warnings) {
-			ruri_warning("{yellow}Warning: pivot_root(2) failed, using chroot(2) instead QwQ\n");
-		}
+		ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: pivot_root(2) failed, using chroot(2) instead QwQ\n");
 		return -1;
 	}
 	chdir("/");
@@ -558,15 +706,19 @@ static void change_user(const struct RURI_CONTAINER *_Nonnull container)
 	 * Change uid and gid.
 	 * It will be called before exec(3).
 	 */
+	int res = 0;
 	setgroups(0, NULL);
 	if (container->skip_setgroups) {
 		if (container->user != NULL) {
 			if (atoi(container->user) > 0) {
-				setgid((gid_t)atoi(container->user));
-				setuid((uid_t)atoi(container->user));
+				res = setgid((gid_t)atoi(container->user));
+				ruri_panic_on_error(res, 0, "{red}Error: failed to set gid QwQ\n");
+				res = setuid((uid_t)atoi(container->user));
+				ruri_panic_on_error(res, 0, "{red}Error: failed to set uid QwQ\n");
 				gid_t groups[1];
 				groups[0] = (gid_t)atoi(container->user);
-				setgroups(1, groups);
+				res = setgroups(1, groups);
+				ruri_panic_on_error(res, 0, "{red}Error: failed to set groups QwQ\n");
 			} else {
 				ruri_error("{red}Skip-setgroups is set, but user is not a uid number QwQ{clear}\n");
 			}
@@ -584,15 +736,20 @@ static void change_user(const struct RURI_CONTAINER *_Nonnull container)
 		gid_t *groups = malloc(NGROUPS_MAX * sizeof(gid_t));
 		groups_count = ruri_get_groups((uid_t)atoi(user), groups);
 		if (groups_count > 0) {
-			setgroups((size_t)groups_count, groups);
+			res = setgroups((size_t)groups_count, groups);
+			ruri_panic_on_error(res, 0, "{red}Error: failed to set groups QwQ\n");
+
 		} else {
 			groups[0] = (gid_t)atoi(user);
-			setgroups(1, groups);
+			res = setgroups(1, groups);
+			ruri_panic_on_error(res, 0, "{red}Error: failed to set groups QwQ\n");
 		}
 		usleep(1000);
 		free(groups);
-		setgid((gid_t)atoi(user));
-		setuid((uid_t)atoi(user));
+		res = setgid((gid_t)atoi(user));
+		ruri_panic_on_error(res, 0, "{red}Error: failed to set gid QwQ\n");
+		res = setuid((uid_t)atoi(user));
+		ruri_panic_on_error(res, 0, "{red}Error: failed to set uid QwQ\n");
 	} else {
 		if (!ruri_user_exist(user)) {
 			if (strcmp(user, "root") == 0) {
@@ -603,26 +760,26 @@ static void change_user(const struct RURI_CONTAINER *_Nonnull container)
 			int groups_count = 0;
 			gid_t *groups = malloc(NGROUPS_MAX * sizeof(gid_t));
 			uid_t user_uid = ruri_get_user_uid(user);
+			gid_t user_gid = ruri_get_user_gid(user);
 			if (RURI_PWD_ERRNO != 0) {
-				ruri_warning("{yellow}Warning: failed to get user info for `%s`: %s{clear}\n", user, strerror(RURI_PWD_ERRNO));
+				ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: failed to get user info for `%s`: %s{clear}\n", user, strerror(RURI_PWD_ERRNO));
 				return;
 			}
 			groups_count = ruri_get_groups(user_uid, groups);
 			if (groups_count > 0) {
-				setgroups((size_t)groups_count, groups);
+				res = setgroups((size_t)groups_count, groups);
+				ruri_panic_on_error(res, 0, "{red}Error: failed to set groups QwQ\n");
 			} else {
 				groups[0] = user_uid;
-				setgroups(1, groups);
+				res = setgroups(1, groups);
+				ruri_panic_on_error(res, 0, "{red}Error: failed to set groups QwQ\n");
 			}
 			usleep(1000);
 			free(groups);
-			gid_t user_gid = ruri_get_user_gid(user);
-			if (RURI_PWD_ERRNO != 0) {
-				ruri_warning("{yellow}Warning: failed to get user info for `%s`: %s{clear}\n", user, strerror(RURI_PWD_ERRNO));
-				return;
-			}
-			setgid(user_gid);
-			setuid(user_uid);
+			res = setgid(user_gid);
+			ruri_panic_on_error(res, 0, "{red}Error: failed to set gid QwQ\n");
+			res = setuid(user_uid);
+			ruri_panic_on_error(res, 0, "{red}Error: failed to set uid QwQ\n");
 		}
 	}
 	ruri_log("{base}Changed to user: %s (uid: %d, gid: %d)\n", user, getuid(), getgid());
@@ -631,7 +788,7 @@ static void change_user(const struct RURI_CONTAINER *_Nonnull container)
 	if (ngroups > 0) {
 		gid_t *groups = malloc((size_t)ngroups * sizeof(gid_t));
 		if (groups == NULL) {
-			ruri_warning("{yellow}Warning: malloc failed when allocating supplementary groups\n");
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: malloc failed when allocating supplementary groups\n");
 			return;
 		}
 		getgroups(ngroups, groups);
@@ -723,7 +880,9 @@ void ruri_run_chroot_container(struct RURI_CONTAINER *_Nonnull container)
 	// mount_host_runtime() and ruri_store_info() will be called here.
 	char buf[PATH_MAX] = { '\0' };
 	// I used to check /sys/class/input, but in WSL1, /sys/class/input is not exist.
-	sprintf(buf, "%s/proc/1", container->container_dir);
+	if (snprintf(buf, sizeof(buf), "%s/proc/1", container->container_dir) >= (int)sizeof(buf)) {
+		ruri_error("{red}Error: container directory path is too long QwQ\n");
+	}
 	char *test = realpath(buf, NULL);
 	if (test == NULL) {
 		// Mount mountpoints.
@@ -765,22 +924,34 @@ void ruri_run_chroot_container(struct RURI_CONTAINER *_Nonnull container)
 	}
 	// Check binary used.
 	check_binary(container);
+	// Set up cgroup limit on host.
+	if (!container->enable_unshare) {
+		ruri_set_limit(container);
+	}
 	// chroot(2) into container, or use pivot_root(2) if `-u` is set.
 	if (!container->enable_unshare) {
-		chdir(container->container_dir);
-		chroot(".");
+		if (chdir(container->container_dir) != 0) {
+			ruri_error("{red}Error: failed to change directory to container dir QwQ\n");
+		}
+		if (chroot(".") == -1) {
+			ruri_error("{red}Error: chroot(2) failed QwQ\n");
+		}
 		chdir("/");
 	} else {
 		if (try_pivot_root(container) == -1) {
-			chdir(container->container_dir);
-			chroot(".");
+			if (chdir(container->container_dir) != 0) {
+				ruri_error("{red}Error: failed to change directory to container dir QwQ\n");
+			}
+			if (chroot(".") == -1) {
+				ruri_error("{red}Error: chroot(2) failed QwQ\n");
+			}
 			chdir("/");
 		}
 	}
 	// Change to the work dir.
 	if (container->work_dir != NULL) {
-		if (chdir(container->work_dir) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: Failed to change to work dir `%s`\n", container->work_dir);
+		if (chdir(container->work_dir) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to change to work dir `%s`\n", container->work_dir);
 		}
 	}
 	// Mount/create system runtime dir/files.
@@ -801,15 +972,23 @@ void ruri_run_chroot_container(struct RURI_CONTAINER *_Nonnull container)
 	}
 	// Umount binfmt_misc apifs.
 	umount2("/proc/sys/fs/binfmt_misc", MNT_DETACH | MNT_FORCE);
-	// Set up cgroup limit.
-	if (!container->just_chroot) {
-		ruri_set_limit(container);
-	}
-	if (container->enable_unshare && container->first_init && false) {
+	if (container->enable_unshare && container->first_init && container->systemd_mode) {
+		/*
+		 * Setup a clean cgroup v2 mount for systemd.
+		 * Let systemd create and manage its own scopes instead of pre-configuring
+		 * subtree_control or cgroup layout from ruri.
+		 */
 		umount2("/sys/fs/cgroup", MNT_DETACH | MNT_FORCE);
-		umount2("/sys/fs/", MNT_DETACH | MNT_FORCE);
-		mkdir("/sys/fs/cgroup", 0555);
-		mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, NULL);
+		umount2("/sys/fs/cgroup", MNT_DETACH | MNT_FORCE);
+		umount2("/sys/fs/cgroup", MNT_DETACH | MNT_FORCE);
+		mkdir("/sys/fs/cgroup", 0755);
+		int cgroup_mount_flags = MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
+		int mount_ret = mount("cgroup2", "/sys/fs/cgroup", "cgroup2", cgroup_mount_flags, NULL);
+		if (mount_ret < 0) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to mount cgroup2: %s\n", strerror(errno));
+		} else {
+			prepare_systemd_cgroup_scope(container);
+		}
 	}
 	// Create character devices.
 	if (container->char_devs[0] != NULL) {
@@ -820,35 +999,38 @@ void ruri_run_chroot_container(struct RURI_CONTAINER *_Nonnull container)
 		set_oom_score(container->oom_score_adj);
 	}
 	// Set up Seccomp BPF.
-	if (container->enable_default_seccomp || container->seccomp_denied_syscall[0] != NULL) {
+	if (container->enable_default_seccomp || container->seccomp_denied_syscall[0] != NULL || container->systemd_mode) {
 		ruri_setup_seccomp(container);
 	}
-	// Drop caps.
+	// Drop specified capabilities.
 	drop_caps(container);
 	// Set envs.
 	set_envs(container);
-	// Fix a bug that the terminal is frozen.
-	usleep(2000);
 	// Set NO_NEW_PRIVS Flag.
 	// It requires Linux3.5 or later.
 	// It will make sudo unavailable in container.
 	if (container->no_new_privs) {
 		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 	}
-	// Disallow raising ambient capabilities via the prctl(2) PR_CAP_AMBIENT_RAISE operation.
-	prctl(PR_SET_SECUREBITS, SECBIT_NO_CAP_AMBIENT_RAISE);
+	if (!container->systemd_mode) {
+		// Disallow raising ambient capabilities via the prctl(2) PR_CAP_AMBIENT_RAISE operation.
+		prctl(PR_SET_SECUREBITS, SECBIT_NO_CAP_AMBIENT_RAISE);
+	}
+	// Change user.
+	change_user(container);
 	// We only need 0(stdin), 1(stdout), 2(stderr),
 	// So we close the other fds to avoid security issues.
 	// NOTE: this might cause unknown issues.
 	for (int i = 3; i <= 10; i++) {
 		close(i);
 	}
-	// Fix console color.
-	cprintf("{clear}");
-	// Change uid and gid.
-	change_user(container);
 	// Execute command in container.
 	// Use exec(3) function because system(3) may be unavailable now.
+	if (container->systemd_mode && container->first_init) {
+		if (getpid() != 1) {
+			ruri_error("{red}Error: systemd mode requires the container to be init process (PID 1) QwQ\n");
+		}
+	}
 	if (execvp(container->command[0], container->command) == -1) {
 		// Catch exceptions.
 		ruri_error("{red}Failed to execute `%s`\nexecv() returned: %d\nerror reason: %s\nNote: unset $LD_PRELOAD before running ruri might fix this{clear}\n", container->command[0], errno, strerror(errno));
@@ -907,8 +1089,8 @@ void ruri_run_rootless_chroot_container(struct RURI_CONTAINER *_Nonnull containe
 	chdir("/");
 	// Change to the work dir.
 	if (container->work_dir != NULL) {
-		if (chdir(container->work_dir) == -1 && !container->no_warnings) {
-			ruri_warning("{yellow}Warning: Failed to change to work dir `%s`\n", container->work_dir);
+		if (chdir(container->work_dir) == -1) {
+			ruri_warn_on_error(1, 0, !container->no_warnings, "{yellow}Warning: Failed to change to work dir `%s`\n", container->work_dir);
 		}
 	}
 	// Fix /etc/mtab.
@@ -943,8 +1125,12 @@ void ruri_run_rootless_chroot_container(struct RURI_CONTAINER *_Nonnull containe
 	if (container->no_new_privs) {
 		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 	}
-	// Disallow raising ambient capabilities via the prctl(2) PR_CAP_AMBIENT_RAISE operation.
-	prctl(PR_SET_SECUREBITS, SECBIT_NO_CAP_AMBIENT_RAISE);
+	if (!container->systemd_mode) {
+		// Disallow raising ambient capabilities via the prctl(2) PR_CAP_AMBIENT_RAISE operation.
+		prctl(PR_SET_SECUREBITS, SECBIT_NO_CAP_AMBIENT_RAISE);
+	}
+	// Change user.
+	change_user(container);
 	// We only need 0(stdin), 1(stdout), 2(stderr),
 	// So we close the other fds to avoid security issues.
 	for (int i = 3; i <= 10; i++) {
@@ -952,8 +1138,6 @@ void ruri_run_rootless_chroot_container(struct RURI_CONTAINER *_Nonnull containe
 	}
 	// Fix console color.
 	cprintf("{clear}");
-	// Change uid and gid.
-	change_user(container);
 	// Execute command in container.
 	// Use exec(3) function because system(3) may be unavailable now.
 	if (execvp(container->command[0], container->command) == -1) {

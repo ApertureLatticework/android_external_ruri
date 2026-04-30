@@ -34,6 +34,8 @@
  * I know code here is too shit, but it works,
  * maybe I will rewrite it one day, I hope.
  */
+// Force panic bit.
+bool ruri_force_panic = false;
 // Clear environment variables.
 void ruri_clear_env(char *const *_Nonnull argv)
 {
@@ -66,7 +68,7 @@ void ruri_clear_env(char *const *_Nonnull argv)
 		fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL);
 		// Replace the current process with the ruri binary in memfd.
 		char path[PATH_MAX];
-		sprintf(path, "/proc/%d/fd/%d", getpid(), fd);
+		snprintf(path, sizeof(path), "/proc/%d/fd/%d", getpid(), fd);
 		if (execve(path, argv, envp) < 0) {
 			execve("/proc/self/exe", argv, envp);
 		}
@@ -185,6 +187,7 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
 		exit(114);
 	}
 	// Init configs.
+	bool even_unstable = false;
 	bool fork_exec = false;
 	bool dump_config = false;
 	char *output_path = NULL;
@@ -573,7 +576,7 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
 					if (container->char_devs[i] == NULL) {
 						container->char_devs[i] = strdup(argv[index]);
 						index++;
-						if (atoi(argv[index]) <= 0) {
+						if (atoi(argv[index]) < 0) {
 							ruri_error("{red}Error: invalid major number QwQ\n");
 						}
 						container->char_devs[i + 1] = strdup(argv[index]);
@@ -583,6 +586,25 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
 						}
 						container->char_devs[i + 2] = strdup(argv[index]);
 						container->char_devs[i + 3] = NULL;
+						// If major is 0, we will auto-detect the major and minor number from the host device.
+						if (atoi(container->char_devs[i + 1]) == 0) {
+							free(container->char_devs[i + 1]);
+							free(container->char_devs[i + 2]);
+							char dev_path[PATH_MAX];
+							sprintf(dev_path, "/dev/%s", container->char_devs[i]);
+							struct stat st;
+							if (stat(dev_path, &st) != 0) {
+								ruri_error("{red}Error: device %s does not exist on host QwQ\n", dev_path);
+							}
+							if (!S_ISCHR(st.st_mode)) {
+								ruri_error("{red}Error: device %s is not a char device on host QwQ\n", dev_path);
+							}
+							container->char_devs[i + 1] = malloc(16);
+							container->char_devs[i + 2] = malloc(16);
+							sprintf(container->char_devs[i + 1], "%d", major(st.st_rdev));
+							sprintf(container->char_devs[i + 2], "%d", minor(st.st_rdev));
+							ruri_log("{base}Auto-detected char device: %s (major: %s, minor: %s)\n", container->char_devs[i], container->char_devs[i + 1], container->char_devs[i + 2]);
+						}
 						break;
 					}
 					if (i == (RURI_MAX_CHAR_DEVS - 1)) {
@@ -681,6 +703,17 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
 			}
 		} else if (strcmp(argv[index], "-z") == 0 || strcmp(argv[index], "--enable-tty-signals") == 0) {
 			container->enable_tty_signals = true;
+		} else if (strcmp(argv[index], "-y") == 0 || strcmp(argv[index], "--systemd") == 0) {
+			container->systemd_mode = true;
+			container->enable_unshare = true;
+		}
+		// Force enable systemd, as it is very unstable and even might panic host.
+		else if (strcmp(argv[index], "--even-unstable") == 0) {
+			even_unstable = true;
+		}
+		// Force panic on error, for security.
+		else if (strcmp(argv[index], "--strict-mode") == 0) {
+			ruri_force_panic = true;
 		}
 		// If use_config_file is true.
 		// The first unrecognized argument will be treated as command to exec in container.
@@ -1093,6 +1126,10 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
 				case 'z':
 					container->enable_tty_signals = true;
 					break;
+				case 'y':
+					container->systemd_mode = true;
+					container->enable_unshare = true;
+					break;
 				case 'O':
 					if (i == (strlen(argv[index]) - 1)) {
 						index++;
@@ -1180,6 +1217,10 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
 			ruri_show_helps();
 			ruri_error("{red}Error: unknown option `%s`\nNote that only existing directory can be detected as CONTAINER_DIR\n", argv[index]);
 		}
+	}
+	// Error If systemd mode is enabled but even_unstable is not enabled, for safety.
+	if (container->systemd_mode && !even_unstable) {
+		ruri_error("{red}Error: systemd mode is very unstable, you must enable --even-unstable to use it, if you know what you are doing\n");
 	}
 	// Fork to background if -b is set.
 	if (background) {
